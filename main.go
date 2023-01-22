@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,13 +30,21 @@ func main() {
 		log.Printf("failed to load config: %s", err)
 	}
 
+	if cfg.Debug {
+		go func() {
+			runtime.SetBlockProfileRate(1)
+			runtime.SetMutexProfileFraction(1)
+			log.Printf("Debug mode enabled, server running at: http://localhost:6060/debug/pprof/")
+			log.Println(http.ListenAndServe("localhost:6060", nil))
+		}()
+	}
+
 	server := NewDDNSUpdater(cfg.Domains, cfg.Interval, cfg.DOToken)
 
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt)
 
 	go func() {
-
 		err := server.Run()
 		if err != nil {
 			log.Printf("error: %v\n", err)
@@ -84,6 +94,7 @@ func LoadConfigFromEnv() (*Config, error) {
 	}
 
 	cfg.Domains = domains
+	cfg.Debug, _ = strconv.ParseBool(os.Getenv("DDNS_DEBUG"))
 
 	return cfg, nil
 }
@@ -94,15 +105,17 @@ type Config struct {
 	Interval time.Duration
 	// Comma separated list of domains to update.
 	Domains []string
+	Debug   bool
 }
 
 // NewDDNSUpdater creates a new DDNS updater
 func NewDDNSUpdater(domains []string, interval time.Duration, token string) *DDNSUpdater {
 	doClient := godo.NewFromToken(token)
 
-	domainTable := make(map[string]godo.DomainRecord, 0)
+	domainTable := make(map[string]godo.DomainRecord, len(domains))
 
 	for _, domain := range domains {
+		// these records get filled during synchronization
 		domainTable[domain] = godo.DomainRecord{}
 	}
 
@@ -130,8 +143,10 @@ type DDNSUpdater struct {
 
 // Shutdown signals the Run method to shut down.
 func (d *DDNSUpdater) Shutdown(ctx context.Context) error {
+	// signal the run loop to exit
 	d.shutdown = true
 
+	// wait for the run loop to exit
 	for _ = range time.Tick(1 * time.Second) {
 		deadline, ok := ctx.Deadline()
 
@@ -147,39 +162,44 @@ func (d *DDNSUpdater) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func (d *DDNSUpdater) SyncRecords() error {
+// syncRecords performs an initial synchronization of DigitalOcean DNS records to the local cache.
+func (d *DDNSUpdater) syncRecords() error {
 	log.Printf("Syncing %d records", len(d.recordMap))
 
-	for hostString, _ := range d.recordMap {
-		url, err := tld.Parse("http://" + hostString)
+	for name, _ := range d.recordMap {
+		// this http:// thing is kind of hacky, but hostname.Parse() doesn't work without it
+		hostname, err := tld.Parse("http://" + name)
 		if err != nil {
-			log.Printf("unable to parse domain (%s): %s", hostString, err)
+			log.Printf("unable to parse domain (%s): %s", name, err)
 
 			continue
 		}
 
-		domain := url.Domain + "." + url.TLD
-		subdomain := url.Subdomain
-		name := subdomain + "." + domain
-		name = strings.TrimPrefix(name, ".")
+		domain := hostname.Domain + "." + hostname.TLD
+		subdomain := hostname.Subdomain
+		dnsName := subdomain + "." + domain
+		// fixes root domains (@)
+		dnsName = strings.TrimPrefix(dnsName, ".")
 
-		log.Printf("searching record domain=%s name=%s original=%s", domain, name, hostString)
+		log.Printf("searching record domain=%s name=%s original=%s", domain, dnsName, name)
 
-		records, _, err := d.doClient.Domains.RecordsByTypeAndName(context.TODO(), domain, "A", name, nil)
+		records, resp, err := d.doClient.Domains.RecordsByTypeAndName(context.TODO(), domain, "A", dnsName, nil)
 		if err != nil {
-			log.Printf("unable to fetch records. domain=%s subdomain=%s name=%s: %s", domain, subdomain, name, err)
+			log.Printf("unable to fetch records. domain=%s subdomain=%s name=%s: %s", domain, subdomain, dnsName, err)
 
 			continue
 		}
+
+		defer resp.Body.Close()
 
 		if len(records) == 0 {
-			log.Printf("no records found for domain=%s subdomain=%s name=%s", domain, subdomain, name)
+			log.Printf("no records found for domain=%s subdomain=%s name=%s", domain, subdomain, dnsName)
 
 			continue
 		}
 
 		record := records[0]
-		d.recordMap[hostString] = record
+		d.recordMap[name] = record
 	}
 
 	return nil
@@ -187,12 +207,12 @@ func (d *DDNSUpdater) SyncRecords() error {
 
 // Run should be run in a go routine. It runs in a loop.
 func (d *DDNSUpdater) Run() error {
-	// should do an initial fetch from DigitalOcean to set the current IP
-	err := d.SyncRecords()
+	err := d.syncRecords()
 	if err != nil {
 		return fmt.Errorf("unable to sync records: %s", err)
 	}
 
+	// use a one second loop so we can capture shutdowns
 	for tick := range time.Tick(1 * time.Second) {
 		now := time.Now()
 
@@ -202,76 +222,17 @@ func (d *DDNSUpdater) Run() error {
 		}
 
 		if d.nextCheck.Before(now) || d.nextCheck.Equal(now) {
-			req, err := http.NewRequestWithContext(context.TODO(), http.MethodGet, CheckIPURL, nil)
+			address, err := d.CheckIP()
 			if err != nil {
-				log.Printf("error while forming request: %v\n", err)
-
-				continue
+				log.Printf("%s", err)
 			}
 
-			resp, err := d.httpClient.Do(req)
-			if err != nil {
-				log.Printf("error while unpacking response: %v\n", err)
-				continue
-			}
-
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				log.Printf("error while reading response body: %v\n", err)
-				continue
-			}
-
-			if resp.StatusCode >= http.StatusBadRequest {
-				log.Printf("error from server (%d) body: \"%s\"\n", resp.StatusCode, body)
-				continue
-			}
-
-			ip := net.ParseIP(strings.TrimSpace(string(body)))
+			ip := net.ParseIP(strings.TrimSpace(address))
 
 			log.Printf("ip=%s ts=%s", ip.String(), tick.String())
 
 			if !d.currentIP.Equal(ip) {
-				oldIP := d.currentIP
-				d.currentIP = ip
-
-				log.Printf("ip changed to %s from %s", ip.String(), oldIP.String())
-
-				for hostname, record := range d.recordMap {
-					if record.Data == d.currentIP.String() {
-						log.Printf("record consistent, skipping update")
-
-						continue
-					}
-
-					url, err := tld.Parse("http://" + hostname)
-					if err != nil {
-						log.Printf("unable to parse domain (%s): %s", hostname, err)
-
-						continue
-					}
-
-					domain := url.Domain + "." + url.TLD
-
-					r, resp, err := d.doClient.Domains.EditRecord(context.TODO(), domain, record.ID, &godo.DomainRecordEditRequest{
-						Data: d.currentIP.String(),
-					})
-					if err != nil {
-						log.Printf("error while updating domain record: %v\n", err)
-
-						continue
-					}
-
-					if resp.StatusCode >= http.StatusBadRequest {
-						log.Printf("error from DO api (%d) body: \"%s\"\n", resp.StatusCode, body)
-						continue
-					}
-
-					log.Printf("updated record for domain=%s name=%s", domain, record.Name)
-
-					d.recordMap[domain] = *r
-				}
-
-				d.lastSet = tick
+				d.updateRecords(ip, tick)
 			} else {
 				log.Printf("ip is unchanged")
 			}
@@ -283,4 +244,81 @@ func (d *DDNSUpdater) Run() error {
 	}
 
 	return nil
+}
+
+func (d *DDNSUpdater) CheckIP() (string, error) {
+	req, err := http.NewRequestWithContext(context.TODO(), http.MethodGet, CheckIPURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("error while forming request: %v", err)
+	}
+
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("error while unpacking response: %v", err)
+	}
+
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("error while reading response body: \"%v\"", err)
+	}
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return "", fmt.Errorf("error from server (%d) body: \"%s\"", resp.StatusCode, body)
+	}
+
+	return strings.TrimSpace(string(body)), nil
+}
+
+// updateRecords updates records in digital ocean
+func (d *DDNSUpdater) updateRecords(ip net.IP, ts time.Time) {
+	oldIP := d.currentIP
+	d.currentIP = ip
+
+	log.Printf("ip changed to %s from %s", ip.String(), oldIP.String())
+
+	for name, record := range d.recordMap {
+		if record.Data == d.currentIP.String() {
+			log.Printf("record consistent, skipping update")
+
+			continue
+		}
+
+		// this http:// thing is kind of hacky, but hostname.Parse() doesn't work without it
+		hostname, err := tld.Parse("http://" + name)
+		if err != nil {
+			log.Printf("unable to parse domain (%s): %s", name, err)
+
+			continue
+		}
+
+		domain := hostname.Domain + "." + hostname.TLD
+
+		r, resp, err := d.doClient.Domains.EditRecord(context.TODO(), domain, record.ID, &godo.DomainRecordEditRequest{
+			Data: d.currentIP.String(),
+		})
+		if err != nil {
+			log.Printf("error while updating domain record: %v", err)
+
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("error while reading response body: \"%v\"", err)
+			continue
+		}
+
+		if resp.StatusCode >= http.StatusBadRequest {
+			log.Printf("error from DO api (%d) body: \"%s\"", resp.StatusCode, body)
+			continue
+		}
+
+		log.Printf("updated record for domain=%s name=%s", domain, record.Name)
+
+		d.recordMap[domain] = *r
+	}
+
+	d.lastSet = ts
 }
